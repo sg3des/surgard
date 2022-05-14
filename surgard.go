@@ -1,6 +1,7 @@
 package surgard
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -8,8 +9,12 @@ import (
 	"time"
 )
 
-const cmdLayout = "5%02d%01d 18%04d%s%03d%02d%03d"
+const cmdLayout = "5%02d%01d 18%04d%01s%03d%02d%03d%s"
 const eoc = "\x14"
+
+//
+// client
+//
 
 type Client struct {
 	addr string
@@ -32,8 +37,6 @@ func (c *Client) Send(cmd string) error {
 	}
 	defer conn.Close()
 
-	log.Printf("surgard: %s", cmd)
-
 	if _, err := conn.Write([]byte(cmd + eoc)); err != nil {
 		return fmt.Errorf("failed to send re-command, %v", err)
 	}
@@ -43,8 +46,6 @@ func (c *Client) Send(cmd string) error {
 	if _, err := conn.Read(b); err != nil {
 		return fmt.Errorf("failed to read response, %v", err)
 	}
-
-	log.Printf("%02x", b)
 
 	// repeat command if it required
 	if b[0] == 0x15 {
@@ -71,8 +72,80 @@ func (c *Client) Dial(d DialData) error {
 		q = "R"
 	}
 
-	cmd := fmt.Sprintf(cmdLayout, d.PP, d.R, d.Object, q, d.Code, d.Group, d.Zone)
+	cmd := fmt.Sprintf(cmdLayout, d.PP, d.R, d.Object, q, d.Code, d.Group, d.Zone, d.Tail)
+
 	return c.Send(cmd)
+}
+
+//
+// server
+//
+
+type Receiver struct {
+	addr    string
+	handler ReceiverHandler
+}
+
+type ReceiverHandler func(data DialData)
+
+func NewReceiver(addr string, handler func(data DialData)) (r *Receiver, err error) {
+	r = &Receiver{addr, handler}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return r, err
+	}
+
+	log.Println("new receiver:", addr)
+
+	for {
+		conn, err := ln.Accept()
+		log.Println("connection", conn.RemoteAddr())
+
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		go r.handleConn(conn)
+	}
+}
+
+var confirm = []byte{0x06}
+
+func (r *Receiver) handleConn(conn net.Conn) {
+	for {
+		b := make([]byte, 128)
+
+		n, err := conn.Read(b)
+		if err != nil {
+			break
+		}
+
+		// ping
+		if b[0] == 0x31 {
+			conn.Write(confirm)
+			continue
+		}
+
+		var d DialData
+		var close string
+		if n, err := fmt.Sscanf(string(b[:n]), cmdLayout, &d.PP, &d.R, &d.Object, &close, &d.Code, &d.Group, &d.Zone, &d.Tail); err != nil {
+			log.Println("failed to parse incoming message:")
+			log.Printf("%v, %d, %+v", err, n, d)
+			fmt.Println(hex.Dump(b[:n]))
+			continue
+		}
+
+		if close == "R" {
+			d.Close = true
+		}
+
+		r.handler(d)
+
+		// confirm message
+		conn.Write(confirm)
+	}
 }
 
 //
@@ -88,6 +161,8 @@ type DialData struct {
 	Code   uint
 	Group  uint
 	Zone   uint
+
+	Tail string
 }
 
 func (d *DialData) Validate() error {
